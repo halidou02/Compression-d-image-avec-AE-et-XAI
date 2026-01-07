@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+venv/
+venv_linux/
+ENV/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data - NE PAS COMMIT
+data/
+CocoData/
+*.jpg
+*.jpeg
+*.png
+*.bmp
+
+# Checkpoints - NE PAS COMMIT
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Results (optionnel - garder les métriques CSV)
+results/*/samples/
+results/*/*.png
+
+# Logs
+*.log
+wandb/
+runs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Colab
+.config/
+sample_data/

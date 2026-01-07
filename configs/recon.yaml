@@ -1,0 +1,38 @@
+# Configuration for Reconstruction Task
+# SSAC-inspired Semantic Communication System
+
+model:
+  encoder_channels: 512
+  smax: 256  # Maximum latent dimension
+  image_size: 256
+
+training:
+  epochs: 50
+  batch_size: 16
+  lr: 0.0005
+  weight_decay: 0.0001
+  
+  # Multi-SNR training range
+  snr_range: [0, 20]  # dB
+  rate_range: [0.1, 1.0]
+  
+  # Loss weights
+  lambda_mse: 1.0
+  lambda_ssim: 0.1
+
+evaluation:
+  snr_values: [0, 5, 10, 15, 20]
+  rate_values: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+  
+  # Quality thresholds for rate selection
+  psnr_threshold: 25.0  # dB
+  ssim_threshold: 0.85
+
+data:
+  root_dir: "../CocoData"
+  num_workers: 4
+  val_split: 0.1
+
+logging:
+  log_interval: 50
+  save_interval: 5

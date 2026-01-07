@@ -1,0 +1,3 @@
+epoch,train_loss,train_psnr,train_mono,train_use,lambda_ssim,grid_avg_psnr,grid_avg_ssim,mono_score
+1,0.015313,26.7786,0.000025,0.072433,0.0525,25.7714,0.7968,0.7778
+2,0.015714,26.7698,0.000025,0.072760,0.0550,25.9673,0.8040,0.6667
