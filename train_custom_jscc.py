@@ -496,10 +496,16 @@ class TeacherGradCAM:
     
     @torch.no_grad()
     def get_cam(self, x):
-        """Generate CAM heatmap for input images."""
+        """Generate CAM heatmap for input images with proper ImageNet normalization."""
+        # Resize to 224x224 and normalize for ImageNet
+        x_in = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+        mean = x_in.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = x_in.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        x_in = (x_in - mean) / std
+        
         # Enable gradients temporarily for CAM
         with torch.enable_grad():
-            x_grad = x.clone().requires_grad_(True)
+            x_grad = x_in.clone().requires_grad_(True)
             
             # Forward pass
             output = self.model(x_grad)
@@ -538,16 +544,17 @@ def compute_psnr(x_hat, x, max_val=1.0):
 
 
 def compute_ssim(x_hat, x, window_size=11):
-    """Compute SSIM (simplified)."""
+    """Compute SSIM (fixed window construction)."""
     C1, C2 = 0.01 ** 2, 0.03 ** 2
     
-    # Gaussian window
+    # Gaussian window - FIXED with torch.outer
     sigma = 1.5
-    coords = torch.arange(window_size).float() - window_size // 2
+    coords = torch.arange(window_size, device=x.device, dtype=x.dtype) - window_size // 2
     g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
     g = g / g.sum()
-    window = g.unsqueeze(0).unsqueeze(0) * g.unsqueeze(0).unsqueeze(0).t()
-    window = window.expand(3, 1, window_size, window_size).to(x.device)
+    
+    window_2d = torch.outer(g, g)  # [ws, ws] - proper outer product
+    window = window_2d.expand(3, 1, window_size, window_size).contiguous()
     
     mu_x = F.conv2d(x, window, padding=window_size // 2, groups=3)
     mu_y = F.conv2d(x_hat, window, padding=window_size // 2, groups=3)
@@ -616,7 +623,7 @@ def get_loss_weights(epoch, total_epochs):
 # ============================================================================
 
 def train_epoch(model, teacher_cam, loader, optimizer, device, epoch, total_epochs, scheduler=None):
-    """Train one epoch."""
+    """Train one epoch with optimizations."""
     model.train()
     
     loss_m = AverageMeter()
@@ -626,31 +633,33 @@ def train_epoch(model, teacher_cam, loader, optimizer, device, epoch, total_epoc
     
     lambda_ssim, lambda_budget, alpha_cam = get_loss_weights(epoch, total_epochs)
     
+    # Eval grid for oversampling (70% from grid, 30% continuous)
+    EVAL_RATES = [0.25, 0.5, 1.0]
+    EVAL_SNRS = [5.0, 10.0, 20.0]
+    
     pbar = tqdm(loader, desc=f'Epoch {epoch} (λ_ssim={lambda_ssim:.2f}, α_cam={alpha_cam:.1f})')
     
-    for images, targets in pbar:
+    for batch_idx, (images, targets) in enumerate(pbar):
         images = images.to(device)
         targets = targets.to(device)
         B = images.size(0)
         
-        # Sample rate/SNR
-        if np.random.rand() < 0.5:
-            rate = np.random.choice([0.25, 0.5, 0.75, 1.0])
+        # Sample rate/SNR - 70% from eval grid, 30% continuous
+        if np.random.rand() < 0.7:
+            rate = float(np.random.choice(EVAL_RATES))
+            snr = float(np.random.choice(EVAL_SNRS))
         else:
             rate = np.random.uniform(0.1, 1.0)
-        
-        if np.random.rand() < 0.5:
-            snr = float(np.random.choice([0, 5, 10, 15, 20]))
-        else:
             snr = float(np.random.uniform(0, 20))
         
         optimizer.zero_grad()
         
-        # Forward
-        result = model(images, snr_db=snr, rate=rate, return_intermediate=True)
-        x_hat = result['output']
-        features = result['features']
-        k = result['k']
+        # Forward - get pre-mask z for budget loss
+        z = model.encoder(images)
+        z_selected, mask, k = model.sr_sc(z, rate)
+        z_norm, scale = model.pssg(z_selected, mask)
+        z_noisy = model.channel(z_norm, snr)
+        x_hat = model.decoder(z_noisy, rate, snr)
         
         # MSE Loss
         mse_loss = F.mse_loss(x_hat, targets)
@@ -659,9 +668,13 @@ def train_epoch(model, teacher_cam, loader, optimizer, device, epoch, total_epoc
         ssim_val = compute_ssim(x_hat, targets)
         ssim_loss = (1 - ssim_val).mean()
         
-        # CAM-Weighted MSE
-        if alpha_cam > 0:
+        # Compute CAM once (if needed)
+        cam = None
+        if alpha_cam > 0 or lambda_budget > 0:
             cam = teacher_cam.get_cam(images)
+        
+        # CAM-Weighted MSE
+        if alpha_cam > 0 and cam is not None:
             cam_full = F.interpolate(cam, size=(256, 256), mode='bilinear', align_corners=False)
             cam_full = cam_full / (cam_full.mean(dim=(2, 3), keepdim=True) + 1e-8)
             weight = 1.0 + alpha_cam * cam_full
@@ -669,11 +682,10 @@ def train_epoch(model, teacher_cam, loader, optimizer, device, epoch, total_epoc
         else:
             wmse = mse_loss
         
-        # Budget Loss
-        if lambda_budget > 0:
-            cam = teacher_cam.get_cam(images)
+        # Budget Loss - using pre-mask features z (not z_selected which is already masked)
+        if lambda_budget > 0 and cam is not None:
             cam_feat = F.interpolate(cam, size=(16, 16), mode='bilinear', align_corners=False)
-            energy = (cam_feat * features.abs()).mean(dim=(2, 3))
+            energy = (cam_feat * z.abs()).mean(dim=(2, 3))  # Use z, not z_selected
             energy_total = energy.sum(dim=1) + 1e-8
             energy_inactive = energy[:, k:].sum(dim=1)
             L_budget = (energy_inactive / energy_total).mean()
@@ -691,8 +703,9 @@ def train_epoch(model, teacher_cam, loader, optimizer, device, epoch, total_epoc
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
         optimizer.step()
         
+        # Scheduler: fractional step for proper warm restarts
         if scheduler:
-            scheduler.step()
+            scheduler.step((epoch - 1) + batch_idx / len(loader))
         
         # Metrics
         with torch.no_grad():
