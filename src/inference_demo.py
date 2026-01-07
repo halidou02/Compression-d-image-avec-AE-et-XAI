@@ -20,7 +20,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import io
 
-from src.models.xai_pipeline import XAIGuidedSemanticComm
+from src.models.jscc_noskip import JSCCNoSkip
 from src.utils.gradcam import GradCAMHook
 from src.utils.metrics import compute_psnr, compute_ssim
 
@@ -36,14 +36,14 @@ def load_model(checkpoint_path: str = None):
     global MODEL, GRADCAM_HOOK, DEVICE
     
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    MODEL = XAIGuidedSemanticComm(num_channels=256, pretrained_encoder=False).to(DEVICE)
+    MODEL = JSCCNoSkip(num_channels=256, pretrained_encoder=False).to(DEVICE)
     
     if checkpoint_path is None:
-        checkpoint_path = Path(__file__).parent.parent / 'checkpoints' / 'best_mono.pt'
+        checkpoint_path = Path(__file__).parent.parent / 'checkpoints' / 'best_noskip.pt'
     
     if Path(checkpoint_path).exists():
-        ckpt = torch.load(checkpoint_path, map_location=DEVICE)
-        MODEL.load_state_dict(ckpt['model_state_dict'])
+        ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
+        MODEL.load_state_dict(ckpt['model_state_dict'], strict=False)
         print(f"Loaded checkpoint: {checkpoint_path}")
         psnr_val = ckpt.get('grid_psnr', ckpt.get('psnr', 0)); print(f'Grid PSNR: {psnr_val:.2f} dB')
     else:
@@ -51,8 +51,8 @@ def load_model(checkpoint_path: str = None):
     
     MODEL.eval()
     
-    # Grad-CAM hook on channel_reduce (256ch)
-    GRADCAM_HOOK = GradCAMHook(MODEL.encoder.channel_reduce)
+    # Grad-CAM hook on encoder layer3
+    GRADCAM_HOOK = GradCAMHook(MODEL.encoder.layer3)
     
     return f"Model loaded on {DEVICE}"
 
