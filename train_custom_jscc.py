@@ -210,7 +210,12 @@ class CustomEncoder(nn.Module):
 # ============================================================================
 
 class SRSC(nn.Module):
-    """Ordered channel selection based on SE-Block importance."""
+    """Progressive channel selection with SE-Block weighting.
+    
+    Note: This uses ORDERED selection (first k channels), not top-k.
+    The model learns to concentrate important info in early channels.
+    SE weights modulate feature importance within selected channels.
+    """
     
     def __init__(self, channels: int):
         super().__init__()
@@ -313,7 +318,8 @@ class FiLMBlock(nn.Module):
         rate_norm = (rate - 0.5) * 2  # [0.1, 1.0] -> [-0.8, 1.0]
         snr_norm = (snr - 10) / 10    # [0, 20] -> [-1, 1]
         
-        cond = torch.tensor([[rate_norm, snr_norm]], device=x.device).expand(B, -1)
+        # FIXED: use x.new_tensor for correct dtype/device
+        cond = x.new_tensor([rate_norm, snr_norm]).unsqueeze(0).expand(B, -1)
         params = self.mlp(cond)
         
         gamma = params[:, :self.channels].view(B, self.channels, 1, 1)
@@ -451,6 +457,9 @@ class CustomJSCC(nn.Module):
         
         # Channel
         z_noisy = self.channel(z_norm, snr_db)
+        
+        # FIXED: Remask after AWGN to keep inactive channels at 0 (strict rate control)
+        z_noisy = z_noisy * mask
         
         # Decode
         x_hat = self.decoder(z_noisy, rate, snr_db)
@@ -630,9 +639,11 @@ def compute_msssim(x_hat, x, window_size=11, weights=None):
             x = F.avg_pool2d(x, 2)
             x_hat = F.avg_pool2d(x_hat, 2)
     
-    # Combine scales
+    # Combine scales (FIXED: include w[-1] exponent on luminance term)
     mcs_vals = torch.stack(mcs_vals[:-1], dim=1)  # [B, 4]
-    msssim = msssim_vals[0] * torch.prod(mcs_vals ** weights[:-1].view(1, -1), dim=1)
+    w = weights.to(device=x.device, dtype=mcs_vals.dtype)
+    
+    msssim = torch.prod(mcs_vals ** w[:-1].view(1, -1), dim=1) * (msssim_vals[0] ** w[-1])
     
     return msssim
 
@@ -793,6 +804,7 @@ def train_epoch(model, teacher_cam, perceptual_loss, loader, optimizer, device, 
         z_selected, mask, k = model.sr_sc(z, rate)
         z_norm, scale = model.pssg(z_selected, mask)
         z_noisy = model.channel(z_norm, snr)
+        z_noisy = z_noisy * mask  # FIXED: Remask after AWGN for strict rate control
         x_hat = model.decoder(z_noisy, rate, snr)
         
         # MSE Loss
