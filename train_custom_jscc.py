@@ -603,38 +603,105 @@ class AverageMeter:
 
 
 # ============================================================================
+# PERCEPTUAL LOSS (VGG19)
+# ============================================================================
+
+class PerceptualLoss(nn.Module):
+    """
+    VGG19-based perceptual loss for better visual quality.
+    Compares features at multiple layers for texture and structure.
+    """
+    
+    def __init__(self, device):
+        super().__init__()
+        
+        # Load VGG19 pretrained
+        vgg = models.vgg19(weights='IMAGENET1K_V1').features
+        
+        # Use features up to relu3_3 (layer 16) and relu4_3 (layer 25)
+        self.slice1 = nn.Sequential(*list(vgg.children())[:4]).to(device)   # relu1_2
+        self.slice2 = nn.Sequential(*list(vgg.children())[4:9]).to(device)  # relu2_2
+        self.slice3 = nn.Sequential(*list(vgg.children())[9:16]).to(device) # relu3_3
+        
+        # Freeze all parameters
+        for param in self.parameters():
+            param.requires_grad = False
+        
+        # ImageNet normalization
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        
+        self.eval()
+        logger.info("Perceptual Loss initialized with VGG19")
+    
+    def normalize(self, x):
+        """Normalize input for VGG."""
+        return (x - self.mean) / self.std
+    
+    def forward(self, x_hat, x):
+        """Compute perceptual loss between reconstruction and original."""
+        # Normalize
+        x_hat_norm = self.normalize(x_hat)
+        x_norm = self.normalize(x)
+        
+        # Extract features
+        f1_hat = self.slice1(x_hat_norm)
+        f1 = self.slice1(x_norm)
+        
+        f2_hat = self.slice2(f1_hat)
+        f2 = self.slice2(f1)
+        
+        f3_hat = self.slice3(f2_hat)
+        f3 = self.slice3(f2)
+        
+        # Compute L1 loss at each layer (L1 often better than L2 for perceptual)
+        loss = F.l1_loss(f1_hat, f1) + F.l1_loss(f2_hat, f2) + F.l1_loss(f3_hat, f3)
+        
+        return loss
+
+
+# ============================================================================
 # LOSS SCHEDULING
 # ============================================================================
 
 def get_loss_weights(epoch, total_epochs):
-    """Progressive loss scheduling."""
+    """Progressive loss scheduling with perceptual loss."""
     if epoch < 10:
         # Phase 1: MSE only
         lambda_ssim = 0.02 * epoch  # 0 -> 0.18
+        lambda_perceptual = 0.0
         lambda_budget = 0.0
         alpha_cam = 0.0
-    elif epoch < 30:
-        # Phase 2: Add budget
+    elif epoch < 20:
+        # Phase 2: Add SSIM + Perceptual
         lambda_ssim = 0.15
-        progress = (epoch - 10) / 20
+        lambda_perceptual = 0.01  # Start perceptual loss
+        lambda_budget = 0.0
+        alpha_cam = 0.0
+    elif epoch < 40:
+        # Phase 3: Add budget
+        lambda_ssim = 0.15
+        lambda_perceptual = 0.02  # Increase perceptual
+        progress = (epoch - 20) / 20
         lambda_budget = 0.005 * progress
         alpha_cam = 0.0
     else:
-        # Phase 3: Full
+        # Phase 4: Full
         lambda_ssim = 0.15
+        lambda_perceptual = 0.02
         lambda_budget = 0.005
-        progress = min(1.0, (epoch - 30) / 20)
+        progress = min(1.0, (epoch - 40) / 20)
         alpha_cam = 0.5 + 1.5 * progress  # 0.5 -> 2.0
     
-    return lambda_ssim, lambda_budget, alpha_cam
+    return lambda_ssim, lambda_perceptual, lambda_budget, alpha_cam
 
 
 # ============================================================================
 # TRAINING
 # ============================================================================
 
-def train_epoch(model, teacher_cam, loader, optimizer, device, epoch, total_epochs, scheduler=None):
-    """Train one epoch with optimizations."""
+def train_epoch(model, teacher_cam, perceptual_loss, loader, optimizer, device, epoch, total_epochs, scheduler=None):
+    """Train one epoch with perceptual loss for visual quality."""
     model.train()
     
     loss_m = AverageMeter()
@@ -642,13 +709,13 @@ def train_epoch(model, teacher_cam, loader, optimizer, device, epoch, total_epoc
     ssim_m = AverageMeter()
     budget_m = AverageMeter()
     
-    lambda_ssim, lambda_budget, alpha_cam = get_loss_weights(epoch, total_epochs)
+    lambda_ssim, lambda_perceptual, lambda_budget, alpha_cam = get_loss_weights(epoch, total_epochs)
     
     # Eval grid for oversampling (70% from grid, 30% continuous)
     EVAL_RATES = [0.25, 0.5, 1.0]
     EVAL_SNRS = [5.0, 10.0, 20.0]
     
-    pbar = tqdm(loader, desc=f'Epoch {epoch} (λ_ssim={lambda_ssim:.2f}, α_cam={alpha_cam:.1f})')
+    pbar = tqdm(loader, desc=f'Epoch {epoch} (λ_perc={lambda_perceptual:.2f}, α_cam={alpha_cam:.1f})')
     
     for batch_idx, (images, targets) in enumerate(pbar):
         images = images.to(device)
@@ -703,8 +770,14 @@ def train_epoch(model, teacher_cam, loader, optimizer, device, epoch, total_epoc
         else:
             L_budget = torch.tensor(0.0, device=device)
         
+        # Perceptual Loss (VGG features)
+        if lambda_perceptual > 0:
+            L_perceptual = perceptual_loss(x_hat, targets)
+        else:
+            L_perceptual = torch.tensor(0.0, device=device)
+        
         # Total Loss
-        L = wmse + lambda_ssim * ssim_loss + lambda_budget * L_budget
+        L = wmse + lambda_ssim * ssim_loss + lambda_perceptual * L_perceptual + lambda_budget * L_budget
         
         # Skip NaN
         if torch.isnan(L) or torch.isinf(L):
@@ -826,6 +899,9 @@ def main():
     # Teacher CAM
     teacher_cam = TeacherGradCAM(device)
     
+    # Perceptual Loss (VGG19)
+    perceptual_loss = PerceptualLoss(device)
+    
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -855,7 +931,7 @@ def main():
         logger.info(f"\n{'='*20} Epoch {epoch}/{args.epochs} {'='*20}")
         
         train_m = train_epoch(
-            model, teacher_cam, train_loader, optimizer, device, epoch, args.epochs,
+            model, teacher_cam, perceptual_loss, train_loader, optimizer, device, epoch, args.epochs,
             scheduler=scheduler
         )
         
