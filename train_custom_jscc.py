@@ -584,6 +584,62 @@ def compute_ssim(x_hat, x, window_size=11):
     return ssim_map.mean(dim=(1, 2, 3))
 
 
+def compute_msssim(x_hat, x, window_size=11, weights=None):
+    """
+    Compute MS-SSIM (Multi-Scale SSIM) for better perceptual quality.
+    Uses 5 scales with standard weights from the original paper.
+    """
+    if weights is None:
+        # Standard weights from Wang et al. 2003
+        weights = torch.tensor([0.0448, 0.2856, 0.3001, 0.2363, 0.1333], device=x.device)
+    
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+    
+    # Gaussian window
+    sigma = 1.5
+    coords = torch.arange(window_size, device=x.device, dtype=x.dtype) - window_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+    window_2d = torch.outer(g, g)
+    window = window_2d.expand(3, 1, window_size, window_size).contiguous()
+    
+    msssim_vals = []
+    mcs_vals = []
+    
+    for i in range(len(weights)):
+        # Compute SSIM at this scale
+        mu_x = F.conv2d(x, window, padding=window_size // 2, groups=3)
+        mu_y = F.conv2d(x_hat, window, padding=window_size // 2, groups=3)
+        
+        mu_x_sq = mu_x ** 2
+        mu_y_sq = mu_y ** 2
+        mu_xy = mu_x * mu_y
+        
+        sigma_x_sq = F.conv2d(x ** 2, window, padding=window_size // 2, groups=3) - mu_x_sq
+        sigma_y_sq = F.conv2d(x_hat ** 2, window, padding=window_size // 2, groups=3) - mu_y_sq
+        sigma_xy = F.conv2d(x * x_hat, window, padding=window_size // 2, groups=3) - mu_xy
+        
+        # Contrast-structure (CS)
+        cs = (2 * sigma_xy + C2) / (sigma_x_sq + sigma_y_sq + C2)
+        mcs_vals.append(cs.mean(dim=(1, 2, 3)))
+        
+        # Full SSIM (only needed for last scale)
+        if i == len(weights) - 1:
+            l = (2 * mu_xy + C1) / (mu_x_sq + mu_y_sq + C1)
+            msssim_vals.append(l.mean(dim=(1, 2, 3)))
+        
+        # Downsample for next scale (except last)
+        if i < len(weights) - 1:
+            x = F.avg_pool2d(x, 2)
+            x_hat = F.avg_pool2d(x_hat, 2)
+    
+    # Combine scales
+    mcs_vals = torch.stack(mcs_vals[:-1], dim=1)  # [B, 4]
+    msssim = msssim_vals[0] * torch.prod(mcs_vals ** weights[:-1].view(1, -1), dim=1)
+    
+    return msssim
+
+
 class AverageMeter:
     """Track running average."""
     def __init__(self):
@@ -742,9 +798,10 @@ def train_epoch(model, teacher_cam, perceptual_loss, loader, optimizer, device, 
         # MSE Loss
         mse_loss = F.mse_loss(x_hat, targets)
         
-        # SSIM Loss
-        ssim_val = compute_ssim(x_hat, targets)
-        ssim_loss = (1 - ssim_val).mean()
+        # MS-SSIM Loss (better than SSIM for perceptual quality)
+        msssim_val = compute_msssim(x_hat.clone(), targets.clone())
+        ssim_val = compute_ssim(x_hat, targets)  # Keep for logging
+        ssim_loss = (1 - msssim_val).mean()  # Use MS-SSIM for loss
         
         # Compute CAM once (if needed)
         cam = None
