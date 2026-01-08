@@ -183,6 +183,7 @@ def test_training_step():
     z_selected, mask, k = model.sr_sc(z, 0.5)
     z_norm, scale = model.pssg(z_selected, mask)
     z_noisy = model.channel(z_norm, 10.0)
+    z_noisy = z_noisy * mask  # Remask after AWGN for strict rate control
     x_hat = model.decoder(z_noisy, 0.5, 10.0)
     
     # Losses
