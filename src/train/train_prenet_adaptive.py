@@ -31,53 +31,60 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 
-def find_optimal_rate(jscc, image, snr_db, rates=[0.1, 0.25, 0.5, 0.75, 1.0], min_psnr=None):
+def compute_channel_score(snr_db, bandwidth_mhz, latency_ms, ber_exp):
     """
-    Find optimal rate for image under given SNR via grid search.
+    Compute channel quality score [0, 1] from network characteristics.
+    Higher score = better channel.
     
-    Strategy:
-    - If min_psnr specified: find lowest rate that achieves min_psnr
-    - Otherwise: find rate that maximizes PSNR * (1 - rate) (quality-efficiency tradeoff)
+    Args: All tensors [B, 1]
+    Returns: score [B, 1]
     """
-    best_rate = 1.0
-    best_score = -float('inf')
+    # SNR score (0-1): 0 dB → 0, 30 dB → 1
+    snr_score = torch.clamp(snr_db / 30.0, 0, 1)
     
-    with torch.no_grad():
-        for rate in rates:
-            result = jscc(image, snr_db=snr_db, rate=rate)
-            x_hat = result['output']
-            psnr = compute_psnr(x_hat, image).mean().item()
-            ssim = compute_ssim(x_hat, image).mean().item()
-            
-            if min_psnr is not None:
-                # Find lowest rate that achieves min_psnr
-                if psnr >= min_psnr:
-                    return rate, psnr, ssim
-            else:
-                # Maximize efficiency: prefer lower rate at similar quality
-                # Score = PSNR - penalty for high rate
-                score = psnr - 5 * rate  # Penalize high rate
-                if score > best_score:
-                    best_score = score
-                    best_rate = rate
-                    best_psnr = psnr
-                    best_ssim = ssim
+    # Bandwidth score: 1 MHz → 0.1, 100 MHz → 1
+    bw_score = torch.clamp(bandwidth_mhz / 100.0, 0.1, 1)
     
-    return best_rate, best_psnr, best_ssim
+    # Latency score: 500 ms → 0.1, 5 ms → 1
+    lat_score = torch.clamp(1.0 - latency_ms / 500.0, 0.1, 1)
+    
+    # BER score: 10^-2 → 0, 10^-6 → 1
+    ber_score = torch.clamp((ber_exp - 2) / 4.0, 0, 1)
+    
+    # Weighted combination
+    score = 0.50 * snr_score + 0.25 * bw_score + 0.10 * lat_score + 0.15 * ber_score
+    
+    return score
+
+
+def compute_target_rate(snr_db, bandwidth_mhz, latency_ms, ber_exp, min_rate=0.1, max_rate=1.0):
+    """
+    Compute target rate from network characteristics.
+    Good channel → high rate (can send more)
+    Bad channel → low rate (must compress more)
+    
+    Returns: rate [B, 1] in [min_rate, max_rate]
+    """
+    score = compute_channel_score(snr_db, bandwidth_mhz, latency_ms, ber_exp)
+    
+    # Direct relationship: good channel → high rate
+    rate = min_rate + (max_rate - min_rate) * score
+    
+    return rate
 
 
 def sample_network_conditions(batch_size, device):
     """Sample random network conditions for training."""
-    snr_db = torch.rand(batch_size, 1, device=device) * 25 + 2  # [2, 27] dB
+    snr_db = torch.rand(batch_size, 1, device=device) * 28 + 2  # [2, 30] dB
     bandwidth_mhz = torch.rand(batch_size, 1, device=device) * 95 + 5  # [5, 100] MHz
     latency_ms = torch.rand(batch_size, 1, device=device) * 495 + 5  # [5, 500] ms
-    ber_exp = torch.randint(2, 7, (batch_size, 1), device=device).float()  # [2, 6]
+    ber_exp = torch.rand(batch_size, 1, device=device) * 4 + 2  # [2, 6] continuous
     
     return snr_db, bandwidth_mhz, latency_ms, ber_exp
 
 
 def train_epoch(prenet, jscc, loader, optimizer, device):
-    """Train one epoch."""
+    """Train one epoch with continuous rate targets."""
     prenet.train()
     jscc.eval()
     
@@ -94,26 +101,22 @@ def train_epoch(prenet, jscc, loader, optimizer, device):
         # Sample network conditions
         snr_db, bandwidth_mhz, latency_ms, ber_exp = sample_network_conditions(B, device)
         
+        # Compute target rate from network characteristics (CONTINUOUS)
+        target_rates = compute_target_rate(snr_db, bandwidth_mhz, latency_ms, ber_exp)
+        
         # Get encoder features
         with torch.no_grad():
             enc_out = jscc.encoder(images)
             z0 = enc_out['z0']
-        
-        # Find optimal rates as ground truth (using single SNR per image)
-        optimal_rates = []
-        gt_psnrs = []
-        gt_ssims = []
-        
-        with torch.no_grad():
-            for i in range(B):
-                snr_val = snr_db[i].item()
-                opt_rate, psnr, ssim = find_optimal_rate(jscc, images[i:i+1], snr_val)
-                optimal_rates.append(opt_rate)
-                gt_psnrs.append(psnr / 50.0)  # Normalize
-                gt_ssims.append(ssim)
-        
-        target_rates = torch.tensor(optimal_rates, device=device).view(B, 1)
-        target_quality = torch.tensor(list(zip(gt_psnrs, gt_ssims)), device=device)  # [B, 2]
+            
+            # Compute actual PSNR/SSIM at target rate for quality prediction training
+            # Use mean rate for the batch for efficiency
+            mean_rate = target_rates.mean().item()
+            mean_snr = snr_db.mean().item()
+            result_jscc = jscc(images, snr_db=mean_snr, rate=mean_rate)
+            gt_psnr = compute_psnr(result_jscc['output'], images)  # [B]
+            gt_ssim = compute_ssim(result_jscc['output'], images)  # [B]
+            target_quality = torch.stack([gt_psnr / 50.0, gt_ssim], dim=1)  # [B, 2]
         
         # Forward through PreNet
         optimizer.zero_grad()
@@ -128,13 +131,13 @@ def train_epoch(prenet, jscc, loader, optimizer, device):
         
         pred_rate = result['rate']
         
-        # Loss: MSE on rate + optional quality prediction
+        # Loss: MSE on rate + quality prediction
         rate_loss = nn.MSELoss()(pred_rate, target_rates)
         
         if 'psnr' in result:
             quality_pred = torch.cat([result['psnr'] / 50, result['ssim']], dim=1)
             quality_loss = nn.MSELoss()(quality_pred, target_quality)
-            loss = rate_loss + 0.5 * quality_loss
+            loss = rate_loss + 0.3 * quality_loss
         else:
             loss = rate_loss
         
@@ -159,10 +162,10 @@ def validate(prenet, jscc, loader, device):
     jscc.eval()
     
     test_conditions = [
-        ("5G (SNR=20, BW=100)", 20.0, 100.0, 10.0, 6),
-        ("WiFi (SNR=15, BW=20)", 15.0, 20.0, 30.0, 5),
-        ("LTE (SNR=10, BW=10)", 10.0, 10.0, 50.0, 4),
-        ("Satellite (SNR=5, BW=5)", 5.0, 5.0, 400.0, 3),
+        ("5G (SNR=20, BW=100)", 20.0, 100.0, 10.0, 6.0),
+        ("WiFi (SNR=15, BW=20)", 15.0, 20.0, 30.0, 5.0),
+        ("LTE (SNR=10, BW=10)", 10.0, 10.0, 50.0, 4.0),
+        ("Satellite (SNR=5, BW=5)", 5.0, 5.0, 400.0, 3.0),
     ]
     
     results = {}
@@ -170,11 +173,17 @@ def validate(prenet, jscc, loader, device):
     with torch.no_grad():
         for name, snr, bw, lat, ber in test_conditions:
             pred_rates = []
-            actual_rates = []
+            
+            # Compute expected rate from formula (ground truth)
+            expected_rate = compute_target_rate(
+                torch.tensor([[snr]], device=device),
+                torch.tensor([[bw]], device=device),
+                torch.tensor([[lat]], device=device),
+                torch.tensor([[ber]], device=device)
+            ).item()
             
             for images, _ in loader:
                 images = images.to(device)
-                B = images.size(0)
                 
                 # Get features
                 z0 = jscc.encoder(images)['z0']
@@ -186,21 +195,15 @@ def validate(prenet, jscc, loader, device):
                     pred_rate = [pred_rate]
                 pred_rates.extend(pred_rate)
                 
-                # Find actual optimal rates
-                for i in range(min(B, 4)):  # Limit for speed
-                    opt_rate, _, _ = find_optimal_rate(jscc, images[i:i+1], snr)
-                    actual_rates.append(opt_rate)
-                
                 if len(pred_rates) >= 50:
                     break
             
             avg_pred = np.mean(pred_rates)
-            avg_actual = np.mean(actual_rates) if actual_rates else avg_pred
-            mae = abs(avg_pred - avg_actual)
+            mae = abs(avg_pred - expected_rate)
             
             results[name] = {
                 'pred_rate': avg_pred,
-                'actual_rate': avg_actual,
+                'expected_rate': expected_rate,
                 'mae': mae
             }
     
@@ -262,7 +265,7 @@ def main():
         
         total_mae = 0
         for name, res in val_results.items():
-            logger.info(f"  {name}: pred={res['pred_rate']:.2f}, actual={res['actual_rate']:.2f}, MAE={res['mae']:.3f}")
+            logger.info(f"  {name}: pred={res['pred_rate']:.2f}, expected={res['expected_rate']:.2f}, MAE={res['mae']:.3f}")
             total_mae += res['mae']
         avg_mae = total_mae / len(val_results)
         
