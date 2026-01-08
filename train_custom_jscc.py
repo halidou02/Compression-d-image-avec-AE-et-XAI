@@ -135,7 +135,7 @@ class ResBlock(nn.Module):
 
 class CustomEncoder(nn.Module):
     """
-    Custom convolutional encoder (no pretrained weights).
+    Custom convolutional encoder - MEDIUM capacity (~20M params).
     Input:  [B, 3, 256, 256]
     Output: [B, 256, 16, 16]
     """
@@ -143,40 +143,47 @@ class CustomEncoder(nn.Module):
     def __init__(self, out_channels: int = 256):
         super().__init__()
         
-        # 256 -> 128
+        # 256 -> 128 (MEDIUM: 128 channels instead of 64)
         self.down1 = nn.Sequential(
-            nn.Conv2d(3, 64, 7, stride=2, padding=3),
-            nn.GroupNorm(32, 64),
-            nn.ReLU(inplace=True),
-            ResBlock(64),
-        )
-        
-        # 128 -> 64
-        self.down2 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
+            nn.Conv2d(3, 128, 7, stride=2, padding=3),
             nn.GroupNorm(32, 128),
             nn.ReLU(inplace=True),
             ResBlock(128),
+            ResBlock(128),  # Extra ResBlock for more capacity
         )
         
-        # 64 -> 32
-        self.down3 = nn.Sequential(
+        # 128 -> 64 (MEDIUM: 256 channels instead of 128)
+        self.down2 = nn.Sequential(
             nn.Conv2d(128, 256, 3, stride=2, padding=1),
             nn.GroupNorm(32, 256),
             nn.ReLU(inplace=True),
             ResBlock(256),
+            ResBlock(256),  # Extra ResBlock
         )
         
-        # 32 -> 16
-        self.down4 = nn.Sequential(
+        # 64 -> 32 (MEDIUM: 512 channels instead of 256)
+        self.down3 = nn.Sequential(
             nn.Conv2d(256, 512, 3, stride=2, padding=1),
             nn.GroupNorm(32, 512),
             nn.ReLU(inplace=True),
             ResBlock(512),
+            ResBlock(512),  # Extra ResBlock
         )
         
-        # Reduce to output channels
+        # 32 -> 16 (MEDIUM: 1024 channels instead of 512)
+        self.down4 = nn.Sequential(
+            nn.Conv2d(512, 1024, 3, stride=2, padding=1),
+            nn.GroupNorm(32, 1024),
+            nn.ReLU(inplace=True),
+            ResBlock(1024),
+            ResBlock(1024),  # Extra ResBlock
+        )
+        
+        # Reduce to output channels (keep latent at 256)
         self.reduce = nn.Sequential(
+            nn.Conv2d(1024, 512, 1),
+            nn.GroupNorm(32, 512),
+            nn.ReLU(inplace=True),
             nn.Conv2d(512, out_channels, 1),
             nn.GroupNorm(32, out_channels),
             nn.ReLU(inplace=True),
@@ -324,7 +331,7 @@ class FiLMBlock(nn.Module):
 
 class CustomDecoder(nn.Module):
     """
-    Custom decoder with progressive refinement.
+    Custom decoder - MEDIUM capacity (~20M params).
     Input:  [B, 256, 16, 16] + rate/snr conditioning
     Output: [B, 3, 256, 256]
     """
@@ -336,56 +343,60 @@ class CustomDecoder(nn.Module):
         self.film = FiLMBlock(in_channels)
         
         # Progressive channel groups
-        self.base_ch = in_channels // 2    # 128: always active
-        self.ref1_ch = in_channels // 4    # 64: active at rate > 0.5
-        self.ref2_ch = in_channels - self.base_ch - self.ref1_ch  # 64: active at rate > 0.75
+        self.base_ch = in_channels // 2
+        self.ref1_ch = in_channels // 4
+        self.ref2_ch = in_channels - self.base_ch - self.ref1_ch
         
-        # Initial processing
+        # Initial processing (MEDIUM: 1024 channels)
         self.initial = nn.Sequential(
-            nn.Conv2d(in_channels, 512, 3, padding=1),
+            nn.Conv2d(in_channels, 1024, 3, padding=1),
+            nn.GroupNorm(32, 1024),
+            nn.ReLU(inplace=True),
+            ResBlock(1024),
+            ResBlock(1024),  # Extra ResBlock
+        )
+        
+        # 16 -> 32 (MEDIUM: 512 channels)
+        self.up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(1024, 512, 3, padding=1),
             nn.GroupNorm(32, 512),
             nn.ReLU(inplace=True),
             ResBlock(512),
+            ResBlock(512),  # Extra ResBlock
         )
         
-        # 16 -> 32
-        self.up1 = nn.Sequential(
+        # 32 -> 64 (MEDIUM: 256 channels)
+        self.up2 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.Conv2d(512, 256, 3, padding=1),
             nn.GroupNorm(32, 256),
             nn.ReLU(inplace=True),
             ResBlock(256),
+            ResBlock(256),  # Extra ResBlock
         )
         
-        # 32 -> 64
-        self.up2 = nn.Sequential(
+        # 64 -> 128 (MEDIUM: 128 channels)
+        self.up3 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.Conv2d(256, 128, 3, padding=1),
             nn.GroupNorm(32, 128),
             nn.ReLU(inplace=True),
             ResBlock(128),
+            ResBlock(128),  # Extra ResBlock
         )
         
-        # 64 -> 128
-        self.up3 = nn.Sequential(
+        # 128 -> 256 (MEDIUM: 64 channels)
+        self.up4 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             nn.Conv2d(128, 64, 3, padding=1),
             nn.GroupNorm(32, 64),
-            nn.ReLU(inplace=True),
-            ResBlock(64),
-        )
-        
-        # 128 -> 256
-        self.up4 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(64, 32, 3, padding=1),
-            nn.GroupNorm(16, 32),
             nn.ReLU(inplace=True),
         )
         
         # Final output
         self.output = nn.Sequential(
-            nn.Conv2d(32, 3, 3, padding=1),
+            nn.Conv2d(64, 3, 3, padding=1),
             nn.Sigmoid(),
         )
         
