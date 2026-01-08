@@ -23,6 +23,7 @@ import io
 from src.models.jscc_noskip import JSCCNoSkip
 from src.utils.gradcam import GradCAMHook
 from src.utils.metrics import compute_psnr, compute_ssim
+from src.utils.rate_selection import ChannelConditions, select_optimal_rate, compute_channel_score
 
 
 # Global model
@@ -181,58 +182,187 @@ def inference(image: np.ndarray, rate: float, snr: float):
     return recon_np, heatmap_np, info, None
 
 
+def inference_with_network(
+    image: np.ndarray,
+    snr_db: float,
+    bandwidth_mhz: float,
+    latency_ms: float,
+    ber_exp: int,
+    use_auto_rate: bool
+):
+    """Run inference with automatic rate selection based on network conditions."""
+    global MODEL, GRADCAM_HOOK, DEVICE
+    
+    if MODEL is None:
+        load_model()
+    
+    if image is None:
+        return None, None, None, "Please upload an image"
+    
+    # Build channel conditions
+    channel = ChannelConditions(
+        snr_db=snr_db,
+        bandwidth_hz=bandwidth_mhz * 1e6,
+        latency_ms=latency_ms,
+        ber=10 ** (-ber_exp),
+        fading_type='none'
+    )
+    
+    # Compute channel score and optimal rate
+    channel_score = compute_channel_score(channel)
+    result = select_optimal_rate(channel)
+    auto_rate = result['rate']
+    
+    # Use auto rate or let user override
+    rate = auto_rate if use_auto_rate else 0.5
+    
+    # Preprocess
+    img_tensor = preprocess_image(image)
+    
+    # Forward with gradient for CAM
+    MODEL.zero_grad()
+    with torch.enable_grad():
+        result = MODEL(img_tensor, snr_db=snr_db, rate=rate, return_intermediate=True)
+        x_hat = result['output']
+        features = result['features']
+        
+        # Backward for CAM
+        loss = ((x_hat - img_tensor) ** 2).sum()
+        loss.backward()
+        
+        # Compute CAM
+        cam = GRADCAM_HOOK.compute_cam()
+    
+    GRADCAM_HOOK.clear()
+    MODEL.zero_grad()
+    
+    # Metrics
+    with torch.no_grad():
+        psnr = compute_psnr(x_hat, img_tensor).item()
+        ssim = compute_ssim(x_hat, img_tensor).item()
+    
+    # Compression info
+    k = max(1, int(round(rate * 256)))
+    total_symbols = 256 * 16 * 16
+    active_symbols = k * 16 * 16
+    compression_ratio = total_symbols / active_symbols
+    bandwidth_savings = (1 - rate) * 100
+    
+    # Create outputs
+    recon_np = tensor_to_numpy(x_hat)
+    heatmap_np = create_heatmap_overlay(tensor_to_numpy(img_tensor), cam[0])
+    
+    # Info text with network info
+    info = f"""
+## Network Conditions
+- **SNR**: {snr_db:.1f} dB
+- **Bandwidth**: {bandwidth_mhz:.1f} MHz
+- **Latency**: {latency_ms:.0f} ms
+- **BER**: 10^-{ber_exp}
+- **Channel Score**: {channel_score:.2f} / 1.00
+
+## Automatic Rate Selection
+- **Auto Rate**: {auto_rate} ({'used' if use_auto_rate else 'override available'})
+
+## Results
+- **PSNR**: {psnr:.2f} dB
+- **SSIM**: {ssim:.4f}
+
+## Compression
+- **Rate Used**: {rate:.2f} ({rate*100:.0f}%)
+- **Active Channels**: {k} / 256
+- **Compression Ratio**: {compression_ratio:.2f}x
+- **Bandwidth Saved**: {bandwidth_savings:.1f}%
+"""
+    
+    return recon_np, heatmap_np, info, None
+
+
 def create_interface():
-    """Create Gradio interface."""
+    """Create Gradio interface with network-aware rate selection."""
     
     with gr.Blocks(title="Semantic Communication Demo", theme=gr.themes.Soft()) as demo:
         gr.Markdown("""
 # 🛰️ Semantic Communication - Inference Demo
 
-Upload an image, adjust **rate** and **SNR**, and see the reconstruction with Grad-CAM heatmap.
+Upload an image and configure network conditions for **automatic rate selection**.
         """)
         
-        with gr.Row():
-            with gr.Column(scale=1):
-                input_image = gr.Image(label="Input Image", type="numpy")
-                
+        with gr.Tabs():
+            # Tab 1: Auto Rate (Network-based)
+            with gr.TabItem("📡 Auto Rate (Network-Aware)"):
                 with gr.Row():
-                    rate_slider = gr.Slider(
-                        minimum=0.1, maximum=1.0, value=0.5, step=0.05,
-                        label="Rate (compression level)"
-                    )
-                    snr_slider = gr.Slider(
-                        minimum=0, maximum=20, value=10, step=1,
-                        label="SNR (dB)"
-                    )
+                    with gr.Column(scale=1):
+                        input_image_auto = gr.Image(label="Input Image", type="numpy")
+                        
+                        gr.Markdown("### Network Conditions")
+                        snr_slider_auto = gr.Slider(
+                            minimum=0, maximum=30, value=15, step=1,
+                            label="SNR (dB)"
+                        )
+                        bw_slider = gr.Slider(
+                            minimum=1, maximum=100, value=20, step=1,
+                            label="Bandwidth (MHz)"
+                        )
+                        latency_slider = gr.Slider(
+                            minimum=5, maximum=500, value=50, step=5,
+                            label="Latency (ms)"
+                        )
+                        ber_slider = gr.Slider(
+                            minimum=2, maximum=6, value=4, step=1,
+                            label="BER Exponent (10^-x)"
+                        )
+                        auto_rate_check = gr.Checkbox(
+                            label="Use Auto Rate", value=True
+                        )
+                        
+                        run_btn_auto = gr.Button("🚀 Run with Network Conditions", variant="primary")
+                    
+                    with gr.Column(scale=2):
+                        with gr.Row():
+                            recon_image_auto = gr.Image(label="Reconstruction")
+                            heatmap_image_auto = gr.Image(label="Grad-CAM Heatmap")
+                        
+                        info_output_auto = gr.Markdown(label="Results")
+                        error_output_auto = gr.Textbox(label="Status", visible=False)
                 
-                run_btn = gr.Button("🚀 Run Inference", variant="primary")
+                run_btn_auto.click(
+                    fn=inference_with_network,
+                    inputs=[input_image_auto, snr_slider_auto, bw_slider, latency_slider, ber_slider, auto_rate_check],
+                    outputs=[recon_image_auto, heatmap_image_auto, info_output_auto, error_output_auto]
+                )
             
-            with gr.Column(scale=2):
+            # Tab 2: Manual Rate
+            with gr.TabItem("🎛️ Manual Rate"):
                 with gr.Row():
-                    recon_image = gr.Image(label="Reconstruction")
-                    heatmap_image = gr.Image(label="Grad-CAM Heatmap")
+                    with gr.Column(scale=1):
+                        input_image = gr.Image(label="Input Image", type="numpy")
+                        
+                        with gr.Row():
+                            rate_slider = gr.Slider(
+                                minimum=0.1, maximum=1.0, value=0.5, step=0.05,
+                                label="Rate (compression level)"
+                            )
+                            snr_slider = gr.Slider(
+                                minimum=0, maximum=20, value=10, step=1,
+                                label="SNR (dB)"
+                            )
+                        
+                        run_btn = gr.Button("🚀 Run Inference", variant="primary")
+                    
+                    with gr.Column(scale=2):
+                        with gr.Row():
+                            recon_image = gr.Image(label="Reconstruction")
+                            heatmap_image = gr.Image(label="Grad-CAM Heatmap")
+                        
+                        info_output = gr.Markdown(label="Results")
+                        error_output = gr.Textbox(label="Status", visible=False)
                 
-                info_output = gr.Markdown(label="Results")
-                error_output = gr.Textbox(label="Status", visible=False)
-        
-        # Examples
-        gr.Examples(
-            examples=[
-                ["examples/cat.jpg", 0.5, 10],
-                ["examples/city.jpg", 0.25, 5],
-                ["examples/portrait.jpg", 1.0, 20],
-            ],
-            inputs=[input_image, rate_slider, snr_slider],
-            outputs=[recon_image, heatmap_image, info_output, error_output],
-            fn=inference,
-            cache_examples=False,
-        )
-        
-        run_btn.click(
-            fn=inference,
-            inputs=[input_image, rate_slider, snr_slider],
-            outputs=[recon_image, heatmap_image, info_output, error_output]
-        )
+                run_btn.click(
+                    fn=inference,
+                    inputs=[input_image, rate_slider, snr_slider],
+                    outputs=[recon_image, heatmap_image, info_output, error_output]
+                )
     
     return demo
 
