@@ -670,14 +670,15 @@ class PerceptualLoss(nn.Module):
     
     def __init__(self, device):
         super().__init__()
+        self.device = device
         
         # Load VGG19 pretrained
         vgg = models.vgg19(weights='IMAGENET1K_V1').features
         
         # Use features up to relu3_3 (layer 16) and relu4_3 (layer 25)
-        self.slice1 = nn.Sequential(*list(vgg.children())[:4]).to(device)   # relu1_2
-        self.slice2 = nn.Sequential(*list(vgg.children())[4:9]).to(device)  # relu2_2
-        self.slice3 = nn.Sequential(*list(vgg.children())[9:16]).to(device) # relu3_3
+        self.slice1 = nn.Sequential(*list(vgg.children())[:4])   # relu1_2
+        self.slice2 = nn.Sequential(*list(vgg.children())[4:9])  # relu2_2
+        self.slice3 = nn.Sequential(*list(vgg.children())[9:16]) # relu3_3
         
         # Freeze all parameters
         for param in self.parameters():
@@ -687,6 +688,8 @@ class PerceptualLoss(nn.Module):
         self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
         
+        # Move entire module to device
+        self.to(device)
         self.eval()
         logger.info("Perceptual Loss initialized with VGG19")
     
