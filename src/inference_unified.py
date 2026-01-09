@@ -1,33 +1,30 @@
 """
-Unified Inference Interface for Semantic Communication.
+Inference Interface for Unified JSCC Model.
 
-Uses two separate models:
-1. JSCCNoSkip - The trained encoder/decoder (best_noskip.pt)
-2. PreNetAdaptive - Rate predictor based on network conditions
+Uses the fused UnifiedJSCC model that combines:
+- JSCCNoSkip (trained encoder/decoder)
+- PreNetAdaptive (rate predictor)
 
 Features:
 - Upload image
 - Configure network conditions (SNR, bandwidth, latency, BER)
 - Automatic rate selection based on network conditions
 - Manual rate override option
-- Display reconstruction + metrics
-- Visualize rate selection across different network scenarios
+- Compare across different networks
 """
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
-import torch.nn.functional as F
 import numpy as np
 import gradio as gr
 from PIL import Image
 import matplotlib.pyplot as plt
 import io
 
-# Import the TWO SEPARATE models
-from src.models.jscc_noskip import JSCCNoSkip
-from src.models.prenet_adaptive import PreNetAdaptive
+# Import unified model
+from scripts.fuse_models import UnifiedJSCC, NetworkConditions
 from src.utils.metrics import compute_psnr, compute_ssim
 
 
@@ -35,48 +32,38 @@ from src.utils.metrics import compute_psnr, compute_ssim
 # Global State
 # ============================================================================
 
-JSCC_MODEL = None
-PRENET_MODEL = None
+MODEL = None
 DEVICE = None
 
 
-def load_model(jscc_path: str = None, prenet_path: str = None):
-    """Load the two separate models."""
-    global JSCC_MODEL, PRENET_MODEL, DEVICE
+def load_model():
+    """Load the unified model."""
+    global MODEL, DEVICE
     
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Default paths
     root = Path(__file__).parent.parent
-    if jscc_path is None:
-        jscc_path = root / 'checkpoints' / 'best_noskip.pt'
-    if prenet_path is None:
-        prenet_path = root / 'results' / 'prenet_adaptive' / 'best_prenet_adaptive.pt'
     
-    # Load JSCCNoSkip (trained encoder/decoder)
-    JSCC_MODEL = JSCCNoSkip(num_channels=256, pretrained_encoder=False).to(DEVICE)
-    if Path(jscc_path).exists():
-        ckpt = torch.load(jscc_path, map_location=DEVICE, weights_only=False)
-        JSCC_MODEL.load_state_dict(ckpt['model_state_dict'])
-        print(f"✅ Loaded JSCC from {jscc_path}")
-        psnr = ckpt.get('grid_psnr', ckpt.get('psnr', 0))
-        print(f"   PSNR: {psnr:.2f} dB")
+    # Try unified checkpoint first
+    unified_path = root / 'checkpoints' / 'unified_jscc.pt'
+    jscc_path = root / 'checkpoints' / 'best_noskip.pt'
+    prenet_path = root / 'results' / 'prenet_adaptive' / 'best_prenet_adaptive.pt'
+    
+    if unified_path.exists():
+        # Load from unified checkpoint
+        MODEL = UnifiedJSCC(num_channels=256).to(DEVICE)
+        ckpt = torch.load(unified_path, map_location=DEVICE, weights_only=False)
+        MODEL.load_state_dict(ckpt['model_state_dict'])
+        print(f"✅ Loaded unified model from {unified_path}")
     else:
-        print(f"⚠️ JSCC checkpoint not found: {jscc_path}")
-    JSCC_MODEL.eval()
+        # Load from separate checkpoints
+        MODEL = UnifiedJSCC.from_pretrained(
+            jscc_path=str(jscc_path),
+            prenet_path=str(prenet_path),
+            device=DEVICE
+        )
     
-    # Load PreNetAdaptive (rate predictor)
-    PRENET_MODEL = PreNetAdaptive(num_channels=256, predict_quality=True).to(DEVICE)
-    if Path(prenet_path).exists():
-        ckpt = torch.load(prenet_path, map_location=DEVICE, weights_only=False)
-        PRENET_MODEL.load_state_dict(ckpt['model_state_dict'])
-        print(f"✅ Loaded PreNet from {prenet_path}")
-    else:
-        print(f"⚠️ PreNet checkpoint not found: {prenet_path}")
-        print("   Using heuristic rate selection instead")
-    PRENET_MODEL.eval()
-    
-    return f"✅ Models loaded on {DEVICE}"
+    MODEL.eval()
+    return f"✅ Model loaded on {DEVICE}"
 
 
 # ============================================================================
@@ -116,16 +103,6 @@ def tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
 # Inference Functions
 # ============================================================================
 
-def compute_channel_score(snr_db, bandwidth_mhz, latency_ms, ber_exp):
-    """Compute rate from network parameters (fallback if no PreNet)."""
-    snr_score = min(1.0, snr_db / 30.0)
-    bw_score = min(1.0, bandwidth_mhz / 100.0)
-    lat_score = max(0.1, 1.0 - latency_ms / 500.0)
-    ber_score = min(1.0, (ber_exp - 2) / 4.0)
-    score = 0.50 * snr_score + 0.25 * bw_score + 0.10 * lat_score + 0.15 * ber_score
-    return 0.1 + 0.9 * score
-
-
 def inference_auto_rate(
     image: np.ndarray,
     snr_db: float,
@@ -133,10 +110,10 @@ def inference_auto_rate(
     latency_ms: float,
     ber_exp: int
 ):
-    """Inference with automatic rate selection using JSCC + PreNet."""
-    global JSCC_MODEL, PRENET_MODEL, DEVICE
+    """Inference with automatic rate selection."""
+    global MODEL, DEVICE
     
-    if JSCC_MODEL is None:
+    if MODEL is None:
         load_model()
     
     if image is None:
@@ -147,30 +124,22 @@ def inference_auto_rate(
         return None, None, "Error processing image"
     
     try:
-        with torch.no_grad():
-            # 1. Get encoder features for PreNet
-            enc_out = JSCC_MODEL.encoder(img_tensor)
-            z0 = enc_out['z0']
-            
-            # 2. Predict rate with PreNet
-            snr_t = torch.tensor([[snr_db]], device=DEVICE)
-            bw_t = torch.tensor([[bandwidth_mhz]], device=DEVICE)
-            lat_t = torch.tensor([[latency_ms]], device=DEVICE)
-            ber_t = torch.tensor([[float(ber_exp)]], device=DEVICE)
-            
-            prenet_result = PRENET_MODEL(z0, snr_t, bw_t, lat_t, ber_t)
-            rate = prenet_result['rate'].item()
-            
-            # 3. Run full JSCC with predicted rate
-            result = JSCC_MODEL(img_tensor, snr_db=snr_db, rate=rate)
-            x_hat = result['output']
-            k = result.get('k', int(rate * 256))
+        network = NetworkConditions(
+            snr_db=snr_db,
+            bandwidth_mhz=bandwidth_mhz,
+            latency_ms=latency_ms,
+            ber_exp=float(ber_exp)
+        )
         
-        # Metrics
+        with torch.no_grad():
+            result = MODEL(img_tensor, network=network)
+        
+        x_hat = result['output']
+        rate = result['rate']
+        k = result['k']
+        
         psnr = compute_psnr(x_hat, img_tensor).item()
         ssim = compute_ssim(x_hat, img_tensor).item()
-        
-        # Compression stats
         bandwidth_saved = (1 - rate) * 100
         
         recon_np = tensor_to_numpy(x_hat)
@@ -184,22 +153,18 @@ def inference_auto_rate(
 | Latency | {latency_ms:.0f} ms |
 | BER | 10^-{ber_exp} |
 
-## 🎯 Auto Rate Selection (PreNet)
+## 🎯 Auto Rate Selection
 | Metric | Value |
 |--------|-------|
-| **Rate (auto)** | **{rate:.2f}** |
-| Active Channels | {k} / 256 |
+| **Rate** | **{rate:.2f}** |
+| Channels | {k} / 256 |
 
 ## 📊 Quality
 | Metric | Value |
 |--------|-------|
 | **PSNR** | **{psnr:.2f} dB** |
 | **SSIM** | **{ssim:.4f}** |
-
-## 📦 Compression
-| Metric | Value |
-|--------|-------|
-| Bandwidth Saved | {bandwidth_saved:.1f}% |
+| BW Saved | {bandwidth_saved:.1f}% |
 """
         return recon_np, info, None
         
@@ -212,10 +177,10 @@ def inference_manual_rate(
     rate: float,
     snr_db: float
 ):
-    """Inference with manual rate using JSCC."""
-    global JSCC_MODEL, DEVICE
+    """Inference with manual rate."""
+    global MODEL, DEVICE
     
-    if JSCC_MODEL is None:
+    if MODEL is None:
         load_model()
     
     if image is None:
@@ -227,10 +192,10 @@ def inference_manual_rate(
     
     try:
         with torch.no_grad():
-            result = JSCC_MODEL(img_tensor, snr_db=snr_db, rate=rate)
+            result = MODEL(img_tensor, snr_db=snr_db, rate_override=rate)
         
         x_hat = result['output']
-        k = result.get('k', int(rate * 256))
+        k = result['k']
         
         psnr = compute_psnr(x_hat, img_tensor).item()
         ssim = compute_ssim(x_hat, img_tensor).item()
@@ -243,7 +208,7 @@ def inference_manual_rate(
 |-----------|-------|
 | Rate | {rate:.2f} |
 | SNR | {snr_db:.1f} dB |
-| Active Channels | {k} / 256 |
+| Channels | {k} / 256 |
 
 ## 📊 Quality
 | Metric | Value |
@@ -259,9 +224,9 @@ def inference_manual_rate(
 
 def compare_networks(image: np.ndarray):
     """Compare reconstruction across different network conditions."""
-    global JSCC_MODEL, PRENET_MODEL, DEVICE
+    global MODEL, DEVICE
     
-    if JSCC_MODEL is None:
+    if MODEL is None:
         load_model()
     
     if image is None:
@@ -271,44 +236,29 @@ def compare_networks(image: np.ndarray):
     if img_tensor is None:
         return None, "Error processing image"
     
-    # Network scenarios
     scenarios = [
-        ("5G", 25, 100, 5, 6),
-        ("WiFi", 15, 20, 30, 5),
-        ("LTE", 10, 10, 50, 4),
-        ("Satellite", 5, 5, 400, 3),
+        ("5G", NetworkConditions(snr_db=25, bandwidth_mhz=100, latency_ms=5, ber_exp=6)),
+        ("WiFi", NetworkConditions(snr_db=15, bandwidth_mhz=20, latency_ms=30, ber_exp=5)),
+        ("LTE", NetworkConditions(snr_db=10, bandwidth_mhz=10, latency_ms=50, ber_exp=4)),
+        ("Satellite", NetworkConditions(snr_db=5, bandwidth_mhz=5, latency_ms=500, ber_exp=3)),
     ]
     
     results = []
     
     try:
         with torch.no_grad():
-            enc_out = JSCC_MODEL.encoder(img_tensor)
-            z0 = enc_out['z0']
-            
-            for name, snr, bw, lat, ber in scenarios:
-                # Predict rate
-                snr_t = torch.tensor([[snr]], device=DEVICE, dtype=torch.float32)
-                bw_t = torch.tensor([[bw]], device=DEVICE, dtype=torch.float32)
-                lat_t = torch.tensor([[lat]], device=DEVICE, dtype=torch.float32)
-                ber_t = torch.tensor([[ber]], device=DEVICE, dtype=torch.float32)
-                
-                prenet_result = PRENET_MODEL(z0, snr_t, bw_t, lat_t, ber_t)
-                rate = prenet_result['rate'].item()
-                
-                # Run JSCC
-                result = JSCC_MODEL(img_tensor, snr_db=snr, rate=rate)
+            for name, network in scenarios:
+                result = MODEL(img_tensor, network=network)
                 psnr = compute_psnr(result['output'], img_tensor).item()
-                
                 results.append({
                     'name': name,
-                    'rate': rate,
+                    'rate': result['rate'],
                     'psnr': psnr,
-                    'k': int(rate * 256),
+                    'k': result['k'],
                     'output': tensor_to_numpy(result['output'])
                 })
         
-        # Create comparison figure
+        # Create figure
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
         
         # Original
@@ -323,7 +273,7 @@ def compare_networks(image: np.ndarray):
             ax.set_title(f"{res['name']}\nRate={res['rate']:.2f}, PSNR={res['psnr']:.1f}dB", fontsize=10)
             ax.axis('off')
         
-        # Rate comparison bar chart
+        # Bar chart
         ax = axes[1, 2]
         names = [r['name'] for r in results]
         rates = [r['rate'] for r in results]
@@ -343,7 +293,7 @@ def compare_networks(image: np.ndarray):
         ax.set_xticklabels(names)
         ax.set_ylim(0, 1)
         ax2.set_ylim(20, 35)
-        ax.set_title('Rate & Quality Comparison')
+        ax.set_title('Rate & Quality')
         
         plt.tight_layout()
         
@@ -373,137 +323,95 @@ def compare_networks(image: np.ndarray):
 def create_interface():
     """Create Gradio interface."""
     
-    with gr.Blocks(title="AdaptiveJSCC - Semantic Communication", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="UnifiedJSCC - Semantic Communication", theme=gr.themes.Soft()) as demo:
         gr.Markdown("""
-# 🛰️ AdaptiveJSCC - Semantic Communication Demo
+# 🛰️ Unified JSCC - Semantic Communication
 
-**Unified model** that automatically selects optimal compression rate based on network conditions.
+**Single model** for automatic rate-adaptive image transmission over wireless channels.
         """)
         
         with gr.Tabs():
             # Tab 1: Auto Rate
-            with gr.TabItem("📡 Auto Rate (Network-Aware)"):
+            with gr.TabItem("📡 Auto Rate"):
                 with gr.Row():
                     with gr.Column(scale=1):
-                        input_image_auto = gr.Image(label="📷 Input Image", type="numpy")
+                        input_auto = gr.Image(label="📷 Input", type="numpy")
                         
-                        gr.Markdown("### 🌐 Network Conditions")
+                        gr.Markdown("### 🌐 Network")
+                        snr = gr.Slider(0, 30, 15, step=1, label="SNR (dB)")
+                        bw = gr.Slider(1, 100, 20, step=1, label="Bandwidth (MHz)")
+                        lat = gr.Slider(5, 500, 50, step=5, label="Latency (ms)")
+                        ber = gr.Slider(2, 6, 4, step=1, label="BER (10^-x)")
                         
-                        snr_slider = gr.Slider(
-                            minimum=0, maximum=30, value=15, step=1,
-                            label="SNR (dB)"
-                        )
-                        bw_slider = gr.Slider(
-                            minimum=1, maximum=100, value=20, step=1,
-                            label="Bandwidth (MHz)"
-                        )
-                        lat_slider = gr.Slider(
-                            minimum=5, maximum=500, value=50, step=5,
-                            label="Latency (ms)"
-                        )
-                        ber_slider = gr.Slider(
-                            minimum=2, maximum=6, value=4, step=1,
-                            label="BER Exponent (10^-x)"
-                        )
-                        
-                        # Preset buttons
-                        gr.Markdown("### 🚀 Quick Presets")
+                        gr.Markdown("### 🚀 Presets")
                         with gr.Row():
-                            preset_5g = gr.Button("5G", size="sm")
-                            preset_wifi = gr.Button("WiFi", size="sm")
-                            preset_lte = gr.Button("LTE", size="sm")
-                            preset_sat = gr.Button("Satellite", size="sm")
+                            btn_5g = gr.Button("5G", size="sm")
+                            btn_wifi = gr.Button("WiFi", size="sm")
+                            btn_lte = gr.Button("LTE", size="sm")
+                            btn_sat = gr.Button("Satellite", size="sm")
                         
-                        run_btn_auto = gr.Button("🔄 Run Inference", variant="primary")
+                        run_auto = gr.Button("🔄 Run", variant="primary")
                     
                     with gr.Column(scale=2):
-                        recon_auto = gr.Image(label="🖼️ Reconstruction")
-                        info_auto = gr.Markdown(label="Results")
-                        error_auto = gr.Textbox(label="Error", visible=False)
+                        out_auto = gr.Image(label="🖼️ Reconstruction")
+                        info_auto = gr.Markdown()
+                        err_auto = gr.Textbox(visible=False)
                 
-                # Preset handlers
-                preset_5g.click(
-                    fn=lambda: (25, 100, 5, 6),
-                    outputs=[snr_slider, bw_slider, lat_slider, ber_slider]
-                )
-                preset_wifi.click(
-                    fn=lambda: (15, 20, 30, 5),
-                    outputs=[snr_slider, bw_slider, lat_slider, ber_slider]
-                )
-                preset_lte.click(
-                    fn=lambda: (10, 10, 50, 4),
-                    outputs=[snr_slider, bw_slider, lat_slider, ber_slider]
-                )
-                preset_sat.click(
-                    fn=lambda: (5, 5, 400, 3),
-                    outputs=[snr_slider, bw_slider, lat_slider, ber_slider]
-                )
+                btn_5g.click(fn=lambda: (25, 100, 5, 6), outputs=[snr, bw, lat, ber])
+                btn_wifi.click(fn=lambda: (15, 20, 30, 5), outputs=[snr, bw, lat, ber])
+                btn_lte.click(fn=lambda: (10, 10, 50, 4), outputs=[snr, bw, lat, ber])
+                btn_sat.click(fn=lambda: (5, 5, 400, 3), outputs=[snr, bw, lat, ber])
                 
-                run_btn_auto.click(
+                run_auto.click(
                     fn=inference_auto_rate,
-                    inputs=[input_image_auto, snr_slider, bw_slider, lat_slider, ber_slider],
-                    outputs=[recon_auto, info_auto, error_auto]
+                    inputs=[input_auto, snr, bw, lat, ber],
+                    outputs=[out_auto, info_auto, err_auto]
                 )
             
-            # Tab 2: Manual Rate
+            # Tab 2: Manual
             with gr.TabItem("🎛️ Manual Rate"):
                 with gr.Row():
                     with gr.Column(scale=1):
-                        input_image_manual = gr.Image(label="📷 Input Image", type="numpy")
-                        
-                        rate_slider = gr.Slider(
-                            minimum=0.1, maximum=1.0, value=0.5, step=0.05,
-                            label="Rate (compression level)"
-                        )
-                        snr_manual = gr.Slider(
-                            minimum=0, maximum=20, value=10, step=1,
-                            label="SNR (dB)"
-                        )
-                        
-                        run_btn_manual = gr.Button("🔄 Run Inference", variant="primary")
+                        input_manual = gr.Image(label="📷 Input", type="numpy")
+                        rate = gr.Slider(0.1, 1.0, 0.5, step=0.05, label="Rate")
+                        snr_m = gr.Slider(0, 20, 10, step=1, label="SNR (dB)")
+                        run_manual = gr.Button("🔄 Run", variant="primary")
                     
                     with gr.Column(scale=2):
-                        recon_manual = gr.Image(label="🖼️ Reconstruction")
-                        info_manual = gr.Markdown(label="Results")
-                        error_manual = gr.Textbox(label="Error", visible=False)
+                        out_manual = gr.Image(label="🖼️ Reconstruction")
+                        info_manual = gr.Markdown()
+                        err_manual = gr.Textbox(visible=False)
                 
-                run_btn_manual.click(
+                run_manual.click(
                     fn=inference_manual_rate,
-                    inputs=[input_image_manual, rate_slider, snr_manual],
-                    outputs=[recon_manual, info_manual, error_manual]
+                    inputs=[input_manual, rate, snr_m],
+                    outputs=[out_manual, info_manual, err_manual]
                 )
             
-            # Tab 3: Network Comparison
-            with gr.TabItem("📊 Compare Networks"):
+            # Tab 3: Compare
+            with gr.TabItem("📊 Compare"):
                 with gr.Row():
                     with gr.Column(scale=1):
-                        input_image_compare = gr.Image(label="📷 Input Image", type="numpy")
-                        run_btn_compare = gr.Button("🔄 Compare Networks", variant="primary")
+                        input_compare = gr.Image(label="📷 Input", type="numpy")
+                        run_compare = gr.Button("🔄 Compare Networks", variant="primary")
                     
                     with gr.Column(scale=2):
-                        compare_output = gr.Image(label="📊 Comparison")
-                        compare_summary = gr.Markdown(label="Summary")
+                        out_compare = gr.Image(label="📊 Comparison")
+                        summary = gr.Markdown()
                 
-                run_btn_compare.click(
+                run_compare.click(
                     fn=compare_networks,
-                    inputs=[input_image_compare],
-                    outputs=[compare_output, compare_summary]
+                    inputs=[input_compare],
+                    outputs=[out_compare, summary]
                 )
         
         gr.Markdown("""
 ---
-### ℹ️ About
-- **Model**: AdaptiveJSCC (~12.5M parameters)
-- **Rate Selection**: Automatic based on SNR, bandwidth, latency, BER
-- **Resolution**: 256×256 pixels
+**Model**: UnifiedJSCC (12.6M params) | **Resolution**: 256×256
         """)
     
     return demo
 
-
-# ============================================================================
-# Main
-# ============================================================================
 
 if __name__ == "__main__":
     print("Loading model...")
