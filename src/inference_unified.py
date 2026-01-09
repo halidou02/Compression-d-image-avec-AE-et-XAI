@@ -1,5 +1,9 @@
 """
-Unified Inference Interface for AdaptiveJSCC.
+Unified Inference Interface for Semantic Communication.
+
+Uses two separate models:
+1. JSCCNoSkip - The trained encoder/decoder (best_noskip.pt)
+2. PreNetAdaptive - Rate predictor based on network conditions
 
 Features:
 - Upload image
@@ -21,8 +25,9 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import io
 
-# Models
-from src.models.adaptive_jscc import AdaptiveJSCC, NetworkConditions
+# Import the TWO SEPARATE models
+from src.models.jscc_noskip import JSCCNoSkip
+from src.models.prenet_adaptive import PreNetAdaptive
 from src.utils.metrics import compute_psnr, compute_ssim
 
 
@@ -30,13 +35,14 @@ from src.utils.metrics import compute_psnr, compute_ssim
 # Global State
 # ============================================================================
 
-MODEL = None
+JSCC_MODEL = None
+PRENET_MODEL = None
 DEVICE = None
 
 
 def load_model(jscc_path: str = None, prenet_path: str = None):
-    """Load unified AdaptiveJSCC model."""
-    global MODEL, DEVICE
+    """Load the two separate models."""
+    global JSCC_MODEL, PRENET_MODEL, DEVICE
     
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -47,15 +53,30 @@ def load_model(jscc_path: str = None, prenet_path: str = None):
     if prenet_path is None:
         prenet_path = root / 'results' / 'prenet_adaptive' / 'best_prenet_adaptive.pt'
     
-    # Load model
-    MODEL = AdaptiveJSCC.from_pretrained(
-        jscc_path=str(jscc_path),
-        prenet_path=str(prenet_path),
-        device=DEVICE
-    )
-    MODEL.eval()
+    # Load JSCCNoSkip (trained encoder/decoder)
+    JSCC_MODEL = JSCCNoSkip(num_channels=256, pretrained_encoder=False).to(DEVICE)
+    if Path(jscc_path).exists():
+        ckpt = torch.load(jscc_path, map_location=DEVICE, weights_only=False)
+        JSCC_MODEL.load_state_dict(ckpt['model_state_dict'])
+        print(f"✅ Loaded JSCC from {jscc_path}")
+        psnr = ckpt.get('grid_psnr', ckpt.get('psnr', 0))
+        print(f"   PSNR: {psnr:.2f} dB")
+    else:
+        print(f"⚠️ JSCC checkpoint not found: {jscc_path}")
+    JSCC_MODEL.eval()
     
-    return f"✅ Model loaded on {DEVICE}"
+    # Load PreNetAdaptive (rate predictor)
+    PRENET_MODEL = PreNetAdaptive(num_channels=256, predict_quality=True).to(DEVICE)
+    if Path(prenet_path).exists():
+        ckpt = torch.load(prenet_path, map_location=DEVICE, weights_only=False)
+        PRENET_MODEL.load_state_dict(ckpt['model_state_dict'])
+        print(f"✅ Loaded PreNet from {prenet_path}")
+    else:
+        print(f"⚠️ PreNet checkpoint not found: {prenet_path}")
+        print("   Using heuristic rate selection instead")
+    PRENET_MODEL.eval()
+    
+    return f"✅ Models loaded on {DEVICE}"
 
 
 # ============================================================================
@@ -95,6 +116,16 @@ def tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
 # Inference Functions
 # ============================================================================
 
+def compute_channel_score(snr_db, bandwidth_mhz, latency_ms, ber_exp):
+    """Compute rate from network parameters (fallback if no PreNet)."""
+    snr_score = min(1.0, snr_db / 30.0)
+    bw_score = min(1.0, bandwidth_mhz / 100.0)
+    lat_score = max(0.1, 1.0 - latency_ms / 500.0)
+    ber_score = min(1.0, (ber_exp - 2) / 4.0)
+    score = 0.50 * snr_score + 0.25 * bw_score + 0.10 * lat_score + 0.15 * ber_score
+    return 0.1 + 0.9 * score
+
+
 def inference_auto_rate(
     image: np.ndarray,
     snr_db: float,
@@ -102,51 +133,49 @@ def inference_auto_rate(
     latency_ms: float,
     ber_exp: int
 ):
-    """Inference with automatic rate selection."""
-    global MODEL, DEVICE
+    """Inference with automatic rate selection using JSCC + PreNet."""
+    global JSCC_MODEL, PRENET_MODEL, DEVICE
     
-    if MODEL is None:
-        status = load_model()
+    if JSCC_MODEL is None:
+        load_model()
     
     if image is None:
         return None, None, "Please upload an image"
     
-    # Preprocess
     img_tensor = preprocess_image(image)
     if img_tensor is None:
         return None, None, "Error processing image"
     
-    # Create network conditions
-    network = NetworkConditions(
-        snr_db=snr_db,
-        bandwidth_mhz=bandwidth_mhz,
-        latency_ms=latency_ms,
-        ber_exp=float(ber_exp)
-    )
-    
-    # Forward
-    MODEL.eval()
-    with torch.no_grad():
-        result = MODEL(img_tensor, network=network)
-    
-    x_hat = result['output']
-    rate = result['rate']
-    k = result['k']
-    
-    # Metrics
-    psnr = compute_psnr(x_hat, img_tensor).item()
-    ssim = compute_ssim(x_hat, img_tensor).item()
-    
-    # Compression stats
-    total_symbols = 256 * 16 * 16
-    active_symbols = k * 16 * 16
-    compression_ratio = total_symbols / active_symbols
-    bandwidth_saved = (1 - rate) * 100
-    
-    # Output
-    recon_np = tensor_to_numpy(x_hat)
-    
-    info = f"""
+    try:
+        with torch.no_grad():
+            # 1. Get encoder features for PreNet
+            enc_out = JSCC_MODEL.encoder(img_tensor)
+            z0 = enc_out['z0']
+            
+            # 2. Predict rate with PreNet
+            snr_t = torch.tensor([[snr_db]], device=DEVICE)
+            bw_t = torch.tensor([[bandwidth_mhz]], device=DEVICE)
+            lat_t = torch.tensor([[latency_ms]], device=DEVICE)
+            ber_t = torch.tensor([[float(ber_exp)]], device=DEVICE)
+            
+            prenet_result = PRENET_MODEL(z0, snr_t, bw_t, lat_t, ber_t)
+            rate = prenet_result['rate'].item()
+            
+            # 3. Run full JSCC with predicted rate
+            result = JSCC_MODEL(img_tensor, snr_db=snr_db, rate=rate)
+            x_hat = result['output']
+            k = result.get('k', int(rate * 256))
+        
+        # Metrics
+        psnr = compute_psnr(x_hat, img_tensor).item()
+        ssim = compute_ssim(x_hat, img_tensor).item()
+        
+        # Compression stats
+        bandwidth_saved = (1 - rate) * 100
+        
+        recon_np = tensor_to_numpy(x_hat)
+        
+        info = f"""
 ## 📡 Network Conditions
 | Parameter | Value |
 |-----------|-------|
@@ -155,7 +184,7 @@ def inference_auto_rate(
 | Latency | {latency_ms:.0f} ms |
 | BER | 10^-{ber_exp} |
 
-## 🎯 Auto Rate Selection
+## 🎯 Auto Rate Selection (PreNet)
 | Metric | Value |
 |--------|-------|
 | **Rate (auto)** | **{rate:.2f}** |
@@ -170,11 +199,12 @@ def inference_auto_rate(
 ## 📦 Compression
 | Metric | Value |
 |--------|-------|
-| Ratio | {compression_ratio:.2f}x |
 | Bandwidth Saved | {bandwidth_saved:.1f}% |
 """
-    
-    return recon_np, info, None
+        return recon_np, info, None
+        
+    except Exception as e:
+        return None, None, f"Error: {str(e)}"
 
 
 def inference_manual_rate(
@@ -182,10 +212,10 @@ def inference_manual_rate(
     rate: float,
     snr_db: float
 ):
-    """Inference with manual rate."""
-    global MODEL, DEVICE
+    """Inference with manual rate using JSCC."""
+    global JSCC_MODEL, DEVICE
     
-    if MODEL is None:
+    if JSCC_MODEL is None:
         load_model()
     
     if image is None:
@@ -195,19 +225,19 @@ def inference_manual_rate(
     if img_tensor is None:
         return None, None, "Error processing image"
     
-    MODEL.eval()
-    with torch.no_grad():
-        result = MODEL(img_tensor, snr_db=snr_db, rate_override=rate)
-    
-    x_hat = result['output']
-    k = result['k']
-    
-    psnr = compute_psnr(x_hat, img_tensor).item()
-    ssim = compute_ssim(x_hat, img_tensor).item()
-    
-    recon_np = tensor_to_numpy(x_hat)
-    
-    info = f"""
+    try:
+        with torch.no_grad():
+            result = JSCC_MODEL(img_tensor, snr_db=snr_db, rate=rate)
+        
+        x_hat = result['output']
+        k = result.get('k', int(rate * 256))
+        
+        psnr = compute_psnr(x_hat, img_tensor).item()
+        ssim = compute_ssim(x_hat, img_tensor).item()
+        
+        recon_np = tensor_to_numpy(x_hat)
+        
+        info = f"""
 ## 🎛️ Manual Settings
 | Parameter | Value |
 |-----------|-------|
@@ -221,15 +251,17 @@ def inference_manual_rate(
 | **PSNR** | **{psnr:.2f} dB** |
 | **SSIM** | **{ssim:.4f}** |
 """
-    
-    return recon_np, info, None
+        return recon_np, info, None
+        
+    except Exception as e:
+        return None, None, f"Error: {str(e)}"
 
 
 def compare_networks(image: np.ndarray):
     """Compare reconstruction across different network conditions."""
-    global MODEL, DEVICE
+    global JSCC_MODEL, PRENET_MODEL, DEVICE
     
-    if MODEL is None:
+    if JSCC_MODEL is None:
         load_model()
     
     if image is None:
@@ -241,82 +273,97 @@ def compare_networks(image: np.ndarray):
     
     # Network scenarios
     scenarios = [
-        ("5G", NetworkConditions(snr_db=25, bandwidth_mhz=100, latency_ms=5, ber_exp=6)),
-        ("WiFi", NetworkConditions(snr_db=15, bandwidth_mhz=20, latency_ms=30, ber_exp=5)),
-        ("LTE", NetworkConditions(snr_db=10, bandwidth_mhz=10, latency_ms=50, ber_exp=4)),
-        ("Satellite", NetworkConditions(snr_db=5, bandwidth_mhz=5, latency_ms=500, ber_exp=3)),
+        ("5G", 25, 100, 5, 6),
+        ("WiFi", 15, 20, 30, 5),
+        ("LTE", 10, 10, 50, 4),
+        ("Satellite", 5, 5, 400, 3),
     ]
     
-    # Collect results
     results = []
-    MODEL.eval()
-    with torch.no_grad():
-        for name, network in scenarios:
-            result = MODEL(img_tensor, network=network)
-            psnr = compute_psnr(result['output'], img_tensor).item()
-            results.append({
-                'name': name,
-                'rate': result['rate'],
-                'psnr': psnr,
-                'k': result['k'],
-                'output': tensor_to_numpy(result['output'])
-            })
     
-    # Create comparison figure
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    
-    # Original
-    axes[0, 0].imshow(tensor_to_numpy(img_tensor))
-    axes[0, 0].set_title("Original", fontsize=12)
-    axes[0, 0].axis('off')
-    
-    # Reconstructions
-    for i, res in enumerate(results):
-        ax = axes[(i + 1) // 3, (i + 1) % 3]
-        ax.imshow(res['output'])
-        ax.set_title(f"{res['name']}\nRate={res['rate']:.2f}, PSNR={res['psnr']:.1f}dB", fontsize=10)
-        ax.axis('off')
-    
-    # Rate comparison bar chart
-    ax = axes[1, 2]
-    names = [r['name'] for r in results]
-    rates = [r['rate'] for r in results]
-    psnrs = [r['psnr'] for r in results]
-    
-    x = np.arange(len(names))
-    width = 0.35
-    
-    bars1 = ax.bar(x - width/2, rates, width, label='Rate', color='steelblue')
-    ax2 = ax.twinx()
-    bars2 = ax2.bar(x + width/2, psnrs, width, label='PSNR', color='coral')
-    
-    ax.set_xlabel('Network')
-    ax.set_ylabel('Rate', color='steelblue')
-    ax2.set_ylabel('PSNR (dB)', color='coral')
-    ax.set_xticks(x)
-    ax.set_xticklabels(names)
-    ax.set_ylim(0, 1)
-    ax2.set_ylim(20, 35)
-    ax.set_title('Rate & Quality Comparison')
-    
-    plt.tight_layout()
-    
-    # Save to buffer
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-    plt.close()
-    buf.seek(0)
-    
-    comparison_img = np.array(Image.open(buf))
-    
-    # Summary table
-    summary = "## 📊 Network Comparison\n\n"
-    summary += "| Network | Rate | Channels | PSNR |\n"
-    summary += "|---------|------|----------|------|\n"
-    for res in results:
-        summary += f"| {res['name']} | {res['rate']:.2f} | {res['k']}/256 | {res['psnr']:.1f} dB |\n"
-    
-    return comparison_img, summary
+    try:
+        with torch.no_grad():
+            enc_out = JSCC_MODEL.encoder(img_tensor)
+            z0 = enc_out['z0']
+            
+            for name, snr, bw, lat, ber in scenarios:
+                # Predict rate
+                snr_t = torch.tensor([[snr]], device=DEVICE, dtype=torch.float32)
+                bw_t = torch.tensor([[bw]], device=DEVICE, dtype=torch.float32)
+                lat_t = torch.tensor([[lat]], device=DEVICE, dtype=torch.float32)
+                ber_t = torch.tensor([[ber]], device=DEVICE, dtype=torch.float32)
+                
+                prenet_result = PRENET_MODEL(z0, snr_t, bw_t, lat_t, ber_t)
+                rate = prenet_result['rate'].item()
+                
+                # Run JSCC
+                result = JSCC_MODEL(img_tensor, snr_db=snr, rate=rate)
+                psnr = compute_psnr(result['output'], img_tensor).item()
+                
+                results.append({
+                    'name': name,
+                    'rate': rate,
+                    'psnr': psnr,
+                    'k': int(rate * 256),
+                    'output': tensor_to_numpy(result['output'])
+                })
+        
+        # Create comparison figure
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        
+        # Original
+        axes[0, 0].imshow(tensor_to_numpy(img_tensor))
+        axes[0, 0].set_title("Original", fontsize=12)
+        axes[0, 0].axis('off')
+        
+        # Reconstructions
+        for i, res in enumerate(results):
+            ax = axes[(i + 1) // 3, (i + 1) % 3]
+            ax.imshow(res['output'])
+            ax.set_title(f"{res['name']}\nRate={res['rate']:.2f}, PSNR={res['psnr']:.1f}dB", fontsize=10)
+            ax.axis('off')
+        
+        # Rate comparison bar chart
+        ax = axes[1, 2]
+        names = [r['name'] for r in results]
+        rates = [r['rate'] for r in results]
+        psnrs = [r['psnr'] for r in results]
+        
+        x = np.arange(len(names))
+        width = 0.35
+        
+        ax.bar(x - width/2, rates, width, label='Rate', color='steelblue')
+        ax2 = ax.twinx()
+        ax2.bar(x + width/2, psnrs, width, label='PSNR', color='coral')
+        
+        ax.set_xlabel('Network')
+        ax.set_ylabel('Rate', color='steelblue')
+        ax2.set_ylabel('PSNR (dB)', color='coral')
+        ax.set_xticks(x)
+        ax.set_xticklabels(names)
+        ax.set_ylim(0, 1)
+        ax2.set_ylim(20, 35)
+        ax.set_title('Rate & Quality Comparison')
+        
+        plt.tight_layout()
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        plt.close()
+        buf.seek(0)
+        
+        comparison_img = np.array(Image.open(buf))
+        
+        summary = "## 📊 Network Comparison\n\n"
+        summary += "| Network | Rate | Channels | PSNR |\n"
+        summary += "|---------|------|----------|------|\n"
+        for res in results:
+            summary += f"| {res['name']} | {res['rate']:.2f} | {res['k']}/256 | {res['psnr']:.1f} dB |\n"
+        
+        return comparison_img, summary
+        
+    except Exception as e:
+        return None, f"Error: {str(e)}"
 
 
 # ============================================================================
